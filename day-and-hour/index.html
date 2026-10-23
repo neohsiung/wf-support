@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day And Hour</title>
+<meta name="description" content="A quiet, legible watch face for Wear OS 5.1 and later. US$2.99 once, coming to Google Play.">
+<style>
+:root{--bg:#fff;--fg:#1d1b17;--mut:#6b665c;--acc:#9a6a12;--line:#e4dfd3}
+@media (prefers-color-scheme:dark){:root{--bg:#000;--fg:#f2eee6;--mut:#a39e92;--acc:#e0a030;--line:#2a2823}}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.6 -apple-system,system-ui,"Segoe UI",sans-serif}
+main{max-width:640px;margin:0 auto;padding:32px 16px 64px}
+h1{font-size:1.75rem;margin:0 0 4px}h2{font-size:1.1rem;margin:32px 0 8px;border-top:1px solid var(--line);padding-top:16px}
+.mut{color:var(--mut)}a{color:var(--acc)}
+.shots{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:24px 0}
+.shots img{width:100%;height:auto;border-radius:50%;background:#000}
+.price{font-weight:600}
+ul{padding-left:1.2em}
+</style>
+</head>
+<body>
+<main>
+<h1>Day And Hour</h1>
+<p>A quiet, legible watch face for Wear OS 5.1 and later.</p>
+<p class="mut">English · <a href="#zh">繁體中文</a></p>
+
+<div class="shots">
+<img src="01-classic.png" alt="Day And Hour, Classic style: large drawn numerals with a day ring and an hour ring" width="454" height="454">
+<img src="02-quiet.png" alt="Day And Hour, Quiet style" width="454" height="454">
+<img src="04-ambient.png" alt="Day And Hour in low-power mode" width="454" height="454">
+</div>
+
+<ul>
+<li>Drawn numerals. 24 ticks tell the day, 60 ticks tell this hour.</li>
+<li>Four slots. Leave any empty.</li>
+<li>Six colors, each with a morning and a night shade.</li>
+<li>No animation, no subscription, no ads.</li>
+</ul>
+
+<p class="price">US$2.99, once. Coming to Google Play.</p>
+<p>We will email you once, when it is on Google Play. We do not charge anything now.</p>
+
+<!-- Tally form xVXgkJ. ?utm_source=<channel> on this page is passed through to the form. -->
+<iframe data-tally-src="https://tally.so/embed/xVXgkJ?alignLeft=1&hideTitle=1&dynamicHeight=1" loading="lazy" width="100%" height="300" frameborder="0" marginheight="0" marginwidth="0" title="Notify me when Day And Hour is on Google Play"></iframe>
+<noscript><p><a href="https://tally.so/r/xVXgkJ">Open the sign-up form</a></p></noscript>
+
+<p class="mut">Works on Wear OS 5.1 or newer only. Not for phones or other watch platforms.</p>
+
+<h2>Your email</h2>
+<p>The form is run by Tally. We use your email and watch model only to send the one launch email and to count which watches people wear. We do not share them. To be removed, write to <a href="mailto:supermfb@gmail.com">supermfb@gmail.com</a>.</p>
+
+<h2 id="zh">繁體中文</h2>
+<p>給 Wear OS 5.1 以上的安靜、好讀的錶面。</p>
+<ul>
+<li>自畫大數字。24 格看一天，60 格看這一小時。</li>
+<li>四個欄位，想留空就留空。</li>
+<li>六種配色，每種分早晚兩色。</li>
+<li>沒有動畫、沒有訂閱、沒有廣告。</li>
+</ul>
+<p class="price">US$2.99，買斷。即將在 Google Play 上架。</p>
+<p>上架時寫一封信通知你，只寄這一封。現在不收任何費用。表單在上方。</p>
+<p class="mut">只適用 Wear OS 5.1 以上，不適用手機與其他手錶系統。</p>
+<p><strong>你的 email：</strong>表單由 Tally 提供。email 與手錶型號只用來寄那一封上架通知，以及統計大家戴哪些錶，不提供給他人。要刪除請寫信到 <a href="mailto:supermfb@gmail.com">supermfb@gmail.com</a>。</p>
+
+<p class="mut"><a href="../">Support and privacy</a></p>
+</main>
+<script>
+// Pass ?utm_source through to the form so sign-ups can be counted per channel. Tally's embed.js loads iframes with data-tally-src; the fallback covers a script that loaded before the iframe was parsed.
+(function(){var src=new URLSearchParams(location.search).get("utm_source");if(src){document.querySelectorAll("iframe[data-tally-src]").forEach(function(e){e.dataset.tallySrc+="&utm_source="+encodeURIComponent(src)})}function load(){if(window.Tally){window.Tally.loadEmbeds();return}document.querySelectorAll("iframe[data-tally-src]:not([src])").forEach(function(e){e.src=e.dataset.tallySrc})}if(document.readyState==="complete"){load()}else{window.addEventListener("load",load)}})();
+</script>
+<script async src="https://tally.so/widgets/embed.js"></script>
+</body>
+</html>
