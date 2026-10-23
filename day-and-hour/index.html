@@ -40,7 +40,7 @@ ul{padding-left:1.2em}
 <p class="price">US$2.99, once. Coming to Google Play.</p>
 <p>We will email you once, when it is on Google Play. We do not charge anything now.</p>
 
-<!-- Tally form xVXgkJ. ?utm_source=<channel> on this page is passed through to the form. -->
+<!-- Tally form xVXgkJ. Tally's embed forwards this page's query string (e.g. ?utm_source=threads) to the form. -->
 <iframe data-tally-src="https://tally.so/embed/xVXgkJ?alignLeft=1&hideTitle=1&dynamicHeight=1" loading="lazy" width="100%" height="300" frameborder="0" marginheight="0" marginwidth="0" title="Notify me when Day And Hour is on Google Play"></iframe>
 <noscript><p><a href="https://tally.so/r/xVXgkJ">Open the sign-up form</a></p></noscript>
 
@@ -65,8 +65,8 @@ ul{padding-left:1.2em}
 <p class="mut"><a href="../">Support and privacy</a></p>
 </main>
 <script>
-// Pass ?utm_source through to the form so sign-ups can be counted per channel. Tally's embed.js loads iframes with data-tally-src; the fallback covers a script that loaded before the iframe was parsed.
-(function(){var src=new URLSearchParams(location.search).get("utm_source");if(src){document.querySelectorAll("iframe[data-tally-src]").forEach(function(e){e.dataset.tallySrc+="&utm_source="+encodeURIComponent(src)})}function load(){if(window.Tally){window.Tally.loadEmbeds();return}document.querySelectorAll("iframe[data-tally-src]:not([src])").forEach(function(e){e.src=e.dataset.tallySrc})}if(document.readyState==="complete"){load()}else{window.addEventListener("load",load)}})();
+// Tally's embed.js loads iframes with data-tally-src; the fallback covers a script that loaded before the iframe was parsed.
+(function(){function load(){if(window.Tally){window.Tally.loadEmbeds();return}document.querySelectorAll("iframe[data-tally-src]:not([src])").forEach(function(e){e.src=e.dataset.tallySrc})}if(document.readyState==="complete"){load()}else{window.addEventListener("load",load)}})();
 </script>
 <script async src="https://tally.so/widgets/embed.js"></script>
 </body>
