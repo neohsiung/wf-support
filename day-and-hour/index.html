@@ -40,9 +40,9 @@ ul{padding-left:1.2em}
 <p class="price">US$2.99, once. Coming to Google Play.</p>
 <p>We will email you once, when it is on Google Play. We do not charge anything now.</p>
 
-<!-- Tally form: replace TALLY_FORM_ID with the form id from tally.so before publishing. -->
-<iframe data-tally-src="https://tally.so/embed/TALLY_FORM_ID?alignLeft=1&hideTitle=1&transparentBackground=1&dynamicHeight=1" loading="lazy" width="100%" height="300" frameborder="0" marginheight="0" marginwidth="0" title="Notify me when Day And Hour is on Google Play"></iframe>
-<noscript><p><a href="https://tally.so/r/TALLY_FORM_ID">Open the sign-up form</a></p></noscript>
+<!-- Tally form xVXgkJ. ?utm_source=<channel> on this page is passed through to the form. -->
+<iframe data-tally-src="https://tally.so/embed/xVXgkJ?alignLeft=1&hideTitle=1&dynamicHeight=1" loading="lazy" width="100%" height="300" frameborder="0" marginheight="0" marginwidth="0" title="Notify me when Day And Hour is on Google Play"></iframe>
+<noscript><p><a href="https://tally.so/r/xVXgkJ">Open the sign-up form</a></p></noscript>
 
 <p class="mut">Works on Wear OS 5.1 or newer only. Not for phones or other watch platforms.</p>
 
@@ -64,10 +64,10 @@ ul{padding-left:1.2em}
 
 <p class="mut"><a href="../">Support and privacy</a></p>
 </main>
-<script async src="https://tally.so/widgets/embed.js"></script>
 <script>
-// Tally's embed.js loads iframes with data-tally-src; this fallback covers a script that loaded before the iframe was parsed.
-(function(){function load(){if(window.Tally){window.Tally.loadEmbeds();return}document.querySelectorAll("iframe[data-tally-src]:not([src])").forEach(function(e){e.src=e.dataset.tallySrc})}if(document.readyState==="complete"){load()}else{window.addEventListener("load",load)}})();
+// Pass ?utm_source through to the form so sign-ups can be counted per channel. Tally's embed.js loads iframes with data-tally-src; the fallback covers a script that loaded before the iframe was parsed.
+(function(){var src=new URLSearchParams(location.search).get("utm_source");if(src){document.querySelectorAll("iframe[data-tally-src]").forEach(function(e){e.dataset.tallySrc+="&utm_source="+encodeURIComponent(src)})}function load(){if(window.Tally){window.Tally.loadEmbeds();return}document.querySelectorAll("iframe[data-tally-src]:not([src])").forEach(function(e){e.src=e.dataset.tallySrc})}if(document.readyState==="complete"){load()}else{window.addEventListener("load",load)}})();
 </script>
+<script async src="https://tally.so/widgets/embed.js"></script>
 </body>
 </html>
