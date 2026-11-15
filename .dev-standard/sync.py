@@ -1,0 +1,1079 @@
+#!/usr/bin/env python3
+"""sync.py — 把 dev-standard 的〈給 agent 的精簡版〉帶進各 repo，並檢查漂移。
+
+來由：investment-advisor 的 scripts/gen_agent_shims.py（單一正本＋產生的區塊＋--check）。
+擴充成跨 repo：每個 repo 存一份正本複本（.dev-standard/STANDARD.md）並以 sha256 釘版本，
+所以 CI 不用連到 dev-standard 也能檢查。只用標準函式庫，相容 python 3.9。
+
+  python3 .dev-standard/sync.py update [--from <dev-standard>] [--adopt]
+                                                                              複製正本與本工具、釘版本、產生區塊。目的地已有「沒被釘過、內容不同」的檔時整個中止、什麼都不寫，
+                                                                              列出檔案；確認要蓋掉才加 --adopt（會先把原檔備份到 .dev-standard/backup/<日期>/，備份不要 commit）
+  python3 .dev-standard/sync.py render                                        依目前的複本產生區塊
+  python3 .dev-standard/sync.py check [--no-local]                            CI 用：複本沒被手改、區塊是最新、元件有掛上；回非 0 表示漂移
+                                                                              （--no-local：不看 core.hooksPath——它是本機狀態，CI 新 clone 一定是空的）
+  python3 .dev-standard/sync.py wire [--dry-run] [--force-hookspath]                              把已裝的元件掛上：core.hooksPath、.claude/settings.json 的 hooks（冪等，先備份 .bak）
+  python3 <dev-standard>/tools/sync.py wire-global [--dry-run] [--home <路徑>]
+                                                                              把全域 hook（components/loopback-hooks）掛進 ~/.claude：hooks/dev-standard/ 建 symlink 指到這個 checkout，
+                                                                              settings.json 併四個 hook entry（冪等、先寫 .bak、壞 JSON 不動），並把 top-level model 設成 sonnet
+  python3 .dev-standard/sync.py status [--from <dev-standard>] 本 repo 釘的版本落後上游多少
+  python3 <dev-standard>/tools/sync.py report <repo> <repo> …                列出各 repo overlay 段落，標出回填候選（只列不判）
+  python3 <dev-standard>/tools/sync.py shadow [--from <dev-standard>] [--repo <路徑>]
+                                                                              影子導入：不是自己的 repo（雇主的、規則檔同事共用的）用這個。config 設 "mode": "shadow"
+                                                                              再 update：不產生區塊、不裝會寫到版控位置的元件；.dev-standard/ 與 .claude-task/ 寫進
+                                                                              .git/info/exclude；建 guard.json 骨架；origin 在 GitHub 就把 hooks 元件的 pre-push 寫到
+                                                                              .git/hooks/pre-push（本機檔）。規則由全域 ~/.claude 帶，hook 由全域 settings.json 掛
+
+--from 省略時依序看 $DEV_STANDARD、~/.claude/.dev-standard/source.local.json 的 dev_standard；都沒有就報錯。
+
+repo 的設定在 .dev-standard/config.json：
+  {"agents_file": "AGENTS.md", "shims": ["CLAUDE.md", "GEMINI.md", ".cursorrules"], "create_missing_shims": false}
+agents_file 與每個 shim 都會有一段 DEV-STANDARD 區塊，區塊外是 repo 自己的 overlay，本工具不碰。
+
+元件（選用）：config.json 加 "components": ["guard", "hooks", …]，update 會把 dev-standard 的
+components/<名>/manifest.json 列的檔複製到目的地、檔頭寫「由 dev-standard vX 產生」、每檔 sha256 釘進 PINNED.json
+的 "components"。check 擋：被手改、缺檔、config 與 pin 對不上、元件裝了卻沒掛上（「未掛載」，見 wire）。manifest 的 "config" 列的是 repo 自己的設定檔
+（例：.dev-standard/guard.json）：缺才從範例建，之後 update 不碰、check 不管。沒有 "components" 的 repo 行為不變。
+"mode": "shadow" 的 repo 見上面的 shadow 子指令：只准裝寫進 .dev-standard/ 的元件（例：wt）。
+"""
+from __future__ import annotations
+
+import datetime
+import difflib
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+VENDOR_DIR = ".dev-standard"
+SRC_RE = re.compile(r"<!-- AGENT-RULES:BEGIN -->\n(.*?)<!-- AGENT-RULES:END -->", re.S)
+GEN_RE = re.compile(r"<!-- DEV-STANDARD:BEGIN[^>]*-->\n(.*?)<!-- DEV-STANDARD:END -->\n?", re.S)
+HEADING_RE = re.compile(r"^(#{2,3})\s+(.+?)\s*$", re.M)
+DEFAULT_CONFIG = {"agents_file": "AGENTS.md", "shims": []}
+COMP_DIR = "components"
+HASH_COMMENT_SUFFIXES = {".py", ".sh", ".yml", ".yaml", ".toml"}
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _read(p: Path) -> str:
+    return p.read_text(encoding="utf-8") if p.exists() else ""
+
+
+def find_repo(start: Path) -> Path:
+    d = start.resolve()
+    for cand in [d, *d.parents]:
+        if (cand / VENDOR_DIR / "config.json").exists() or (cand / ".git").exists():
+            return cand
+    return d
+
+
+def load_config(repo: Path) -> dict:
+    p = repo / VENDOR_DIR / "config.json"
+    cfg = dict(DEFAULT_CONFIG)
+    if p.exists():
+        cfg.update(json.loads(p.read_text(encoding="utf-8")))
+    return cfg
+
+
+SHADOW_MODE = "shadow"
+
+
+def is_shadow(cfg: dict) -> bool:
+    return cfg.get("mode") == SHADOW_MODE
+
+
+def _sha_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+def _safe_rel(rel: str, what: str) -> str:
+    parts = rel.split("/")
+    if not rel or rel.startswith("/") or ".." in parts:
+        raise SystemExit(f"manifest 的 {what}「{rel}」必須是不含 .. 的相對路徑")
+    return rel
+
+
+def load_manifest(src: Path, name: str) -> tuple:
+    """回傳 (元件目錄, manifest)。名稱不存在或 manifest 壞掉就大聲失敗。"""
+    d = src / COMP_DIR / name
+    mp = d / "manifest.json"
+    if not mp.is_file():
+        known = sorted(p.parent.name for p in (src / COMP_DIR).glob("*/manifest.json"))
+        raise SystemExit(f"未知的元件「{name}」：{mp} 不存在（上游有的元件：{', '.join(known) or '無'}）")
+    try:
+        man = json.loads(mp.read_text(encoding="utf-8"))
+    except ValueError as e:
+        raise SystemExit(f"{mp} 不是合法 JSON：{e}")
+    if not isinstance(man.get("files"), list) or not man["files"]:
+        raise SystemExit(f"{mp} 缺 files 清單")
+    return d, man
+
+
+def add_header(text: str, dst: str, name: str, version: str) -> str:
+    """在檔案開頭（shebang、frontmatter 之後）寫一行「由 dev-standard 產生」。不確定語法的檔不寫。"""
+    msg = f"由 dev-standard v{version} 產生，請勿手改；要改請改 dev-standard 的 components/{name}，再跑 sync.py update"
+    suffix = Path(dst).suffix.lower()
+    if text.startswith("#!"):
+        first, _, rest = text.partition("\n")
+        return f"{first}\n# {msg}\n{rest}"
+    if suffix in HASH_COMMENT_SUFFIXES:
+        return f"# {msg}\n{text}"
+    if suffix == ".md":
+        c = f"<!-- {msg} -->\n"
+        if text.startswith("---\n"):
+            i = text.find("\n---\n", 4)
+            if i != -1:
+                j = i + len("\n---\n")
+                return text[:j] + c + text[j:]
+        return c + text
+    return text
+
+
+TEMPLATES_REL = ".dev-standard/templates.json"
+_PR_KEYS, _SECTION_KEYS, _ISSUE_KEYS = {"risk_hint", "sections", "checklist"}, {"title", "hint", "after"}, \
+    {"blank_issues_enabled", "contact_links"}
+
+
+def _line(v, what: str, required: bool = True) -> str:
+    """範本裡的一行字：要是單行字串，不能含 -->（會提早結束 HTML 註解）。"""
+    if not isinstance(v, str) or (required and not v.strip()):
+        raise SystemExit(f"templates.json 的 {what} 要是非空字串")
+    if any(ch in v for ch in "\n\r\x0b\x0c\x85\u2028\u2029"):   # 含 YAML 視為換行的 Unicode 字元
+        raise SystemExit(f"templates.json 的 {what} 要是單行")
+    if "-->" in v:
+        raise SystemExit(f"templates.json 的 {what} 不能含 -->")
+    return v
+
+
+def _known(d, allowed: set, what: str) -> dict:
+    if not isinstance(d, dict):
+        raise SystemExit(f"templates.json 的 {what} 要是物件")
+    bad = sorted(set(d) - allowed)
+    if bad:
+        raise SystemExit(f"templates.json 的 {what}有不認得的欄位：{', '.join(bad)}（只接受 {', '.join(sorted(allowed))}）")
+    return d
+
+
+def load_templates(repo: Path) -> dict:
+    """repo 對 pr-template、issue-templates 的差異。檔案可以不存在；寫錯一律中止，不退回預設、不寫半套。"""
+    p = repo / TEMPLATES_REL
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise SystemExit(f"{TEMPLATES_REL} 不是合法 JSON：{e}")
+    except OSError as e:
+        raise SystemExit(f"{TEMPLATES_REL} 讀不到：{e}")
+    if not isinstance(data, dict):
+        raise SystemExit(f"{TEMPLATES_REL} 最外層要是物件")
+    bad = sorted(set(data) - {"pr", "issues"})
+    if bad:
+        raise SystemExit(f"templates.json 有不認得的欄位：{', '.join(bad)}（只接受 pr、issues）")
+    pr = _known(data.get("pr", {}), _PR_KEYS, "pr ")
+    if "risk_hint" in pr:
+        _line(pr["risk_hint"], "pr.risk_hint")
+    secs = pr.get("sections", [])
+    if not isinstance(secs, list):
+        raise SystemExit("templates.json 的 pr.sections 要是清單")
+    for i, sec in enumerate(secs, 1):
+        _known(sec, _SECTION_KEYS, f"pr.sections 第 {i} 個")
+        _line(sec.get("title"), f"pr.sections 第 {i} 個的 title")
+        for k in ("hint", "after"):
+            if k in sec:
+                _line(sec[k], f"pr.sections 第 {i} 個的 {k}")
+    items = pr.get("checklist", [])
+    if not isinstance(items, list):
+        raise SystemExit("templates.json 的 pr.checklist 要是字串清單")
+    for i, it in enumerate(items, 1):
+        _line(it, f"pr.checklist 第 {i} 項")
+    iss = _known(data.get("issues", {}), _ISSUE_KEYS, "issues ")
+    if "blank_issues_enabled" in iss and not isinstance(iss["blank_issues_enabled"], bool):
+        raise SystemExit("templates.json 的 issues.blank_issues_enabled 要是 true 或 false")
+    links = iss.get("contact_links", [])
+    if not isinstance(links, list):
+        raise SystemExit("templates.json 的 issues.contact_links 要是清單")
+    for i, ln in enumerate(links, 1):
+        if not isinstance(ln, dict) or set(ln) != {"name", "url", "about"}:
+            raise SystemExit(f"templates.json 的 issues.contact_links 第 {i} 個要剛好有 name、url、about")
+        for k in ("name", "url", "about"):
+            _line(ln[k], f"issues.contact_links 第 {i} 個的 {k}")
+    return data
+
+
+def render_pr_template(text: str, pr: dict) -> str:
+    lines = text.split("\n")
+    if pr.get("risk_hint"):
+        hint = f"<!-- {pr['risk_hint']} -->"
+        a, b = lines[0].find("<!--"), lines[0].rfind("-->")   # 用字串找註解，不用 regex（CodeQL py/bad-tag-filter）
+        lines[0] = lines[0][:a] + hint + lines[0][b + 3:] if 0 <= a < b else f"{lines[0]}   {hint}"
+
+    def heading(title):
+        return next((i for i, ln in enumerate(lines) if ln == f"## {title}"), None)
+
+    for sec in pr.get("sections", []):
+        anchor = sec.get("after")
+        if anchor:
+            h = heading(anchor)
+            if h is None:
+                raise SystemExit(f"templates.json：PR 範本找不到段落「{anchor}」（pr.sections 的 after）")
+            at = next((i for i in range(h + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+        else:
+            at = heading("檢查清單")
+        block = [f"## {sec['title']}"] + ([f"<!-- {sec['hint']} -->"] if sec.get("hint") else []) + [""]
+        lines[at:at] = block
+    if pr.get("checklist"):
+        h = heading("檢查清單")
+        last = max(i for i in range(h, len(lines)) if lines[i].startswith("- [ ]") and
+                   all(not lines[j].startswith("## ") for j in range(h + 1, i + 1)))
+        lines[last + 1:last + 1] = [f"- [ ] {it}" for it in pr["checklist"]]
+    return "\n".join(lines)
+
+
+def render_issue_config(text: str, iss: dict) -> str:
+    if not iss:
+        return text
+    out = [f"blank_issues_enabled: {'true' if iss.get('blank_issues_enabled', True) else 'false'}"]
+    links = iss.get("contact_links", [])
+    if not links:
+        out.append("contact_links: []")
+    else:
+        out.append("contact_links:")
+        for ln in links:   # json 字串（全 ASCII 跳脫）就是合法的 YAML 雙引號字串，含冒號、#、非 ASCII 都安全
+            out += [f"  - name: {json.dumps(ln['name'], ensure_ascii=True)}",
+                    f"    url: {json.dumps(ln['url'], ensure_ascii=True)}",
+                    f"    about: {json.dumps(ln['about'], ensure_ascii=True)}"]
+    return "\n".join(out) + "\n"
+
+
+# (元件, 來源檔) → 套用 templates.json 的函式
+RENDERERS = {("pr-template", "pull_request_template.md"): lambda t, f: render_pr_template(t, f.get("pr", {})),
+             ("issue-templates", "config.yml"): lambda t, f: render_issue_config(t, f.get("issues", {}))}
+
+
+def plan_components(src: Path, names: list, version: str, fields: dict = None) -> tuple:
+    """先把所有元件讀完驗完，回傳 (檔案清單, 設定檔清單)；任何一個有問題就整個失敗，不留半套。"""
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        raise SystemExit("config.json 的 components 必須是字串清單")
+    files, configs, seen = [], [], {}
+    for name in names:
+        d, man = load_manifest(src, name)
+        if man.get("global"):
+            raise SystemExit(f"元件「{name}」是全域元件，不裝進 repo；從 config.json 的 components 拿掉，"
+                             "改在這個 dev-standard checkout 跑 python3 tools/sync.py wire-global")
+        for f in man["files"]:
+            fsrc, dst = f.get("src", ""), _safe_rel(f.get("dst", ""), "dst")
+            sp = d / _safe_rel(fsrc, "src")
+            if not sp.is_file():
+                raise SystemExit(f"元件「{name}」的來源檔不存在：{sp}")
+            if dst in seen:
+                raise SystemExit(f"元件「{name}」與「{seen[dst]}」都要寫到 {dst}")
+            seen[dst] = name
+            raw = sp.read_bytes()
+            try:
+                text = raw.decode("utf-8")
+                if (name, fsrc) in RENDERERS:
+                    text = RENDERERS[(name, fsrc)](text, fields or {})
+                body = add_header(text, dst, name, version).encode("utf-8")
+            except UnicodeDecodeError:
+                body = raw                                     # 二進位檔不寫檔頭
+            files.append((name, dst, body, int(str(f.get("mode", "644")), 8)))
+        for c in man.get("config", []):
+            ex = d / _safe_rel(c.get("example", ""), "example")
+            if not ex.is_file():
+                raise SystemExit(f"元件「{name}」的設定範例不存在：{ex}")
+            configs.append((_safe_rel(c.get("dst", ""), "config dst"), ex.read_bytes()))
+    return files, configs
+
+
+def write_components(repo: Path, files: list, configs: list, old_pin: dict) -> dict:
+    """寫檔、建缺的設定檔、清掉上游已拿掉且沒被改過的舊檔。回傳要釘的 {元件: {files: {dst: sha}}}。"""
+    pins: dict = {}
+    for name, dst, body, mode in files:
+        p = repo / dst
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(body)
+        p.chmod(mode)
+        pins.setdefault(name, {"files": {}})["files"][dst] = _sha_bytes(body)
+    for dst, body in configs:
+        p = repo / dst
+        if not p.exists():                                     # repo 自己的設定：只建不覆蓋
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(body)
+    new_dsts = {dst for _n, dst, _b, _m in files}
+    for name, info in old_pin.get("components", {}).items():
+        for dst, sha in info.get("files", {}).items():
+            if dst in new_dsts:
+                continue
+            _safe_rel(dst, "PINNED 的檔案路徑")                 # PINNED.json 是 repo 裡的檔，不可信：不准刪到 repo 外面
+            p = repo / dst
+            if not p.exists():
+                continue
+            if _sha_bytes(p.read_bytes()) == sha:
+                p.unlink()
+            else:
+                print(f"提醒：上游已不再提供 {dst}（元件 {name}），但本地被改過，沒有刪")
+    return pins
+
+
+def unpinned_conflicts(repo: Path, files: list, old_pin: dict) -> list:
+    """會蓋掉「不是上次 update 寫的、內容也不同」的既有檔的 dst 清單（使用者自己的檔，不能靜默覆蓋）。"""
+    pinned_dsts = {d for info in old_pin.get("components", {}).values() for d in info.get("files", {})}
+    out = []
+    for _name, dst, body, _mode in files:
+        p = repo / dst
+        if dst not in pinned_dsts and p.is_file() and p.read_bytes() != body:
+            out.append(dst)
+    return out
+
+
+def backup_files(repo: Path, dsts: list) -> Path:
+    """把 dsts 原樣複製到 .dev-standard/backup/<日期>/<dst>。名稱不加 .bak／.pre-*，免得被 pre-commit 的殘留檔檢查誤認。"""
+    bd = repo / VENDOR_DIR / "backup" / datetime.date.today().strftime("%Y%m%d")
+    for dst in dsts:
+        t = bd / dst
+        t.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(repo / dst, t)
+    return bd
+
+
+def agent_block(standard_text: str) -> str:
+    m = SRC_RE.search(standard_text)
+    if not m:
+        raise SystemExit("STANDARD.md 沒有 <!-- AGENT-RULES:BEGIN --> … <!-- AGENT-RULES:END --> 區塊")
+    return m.group(1).strip() + "\n"
+
+
+def render_block(block: str, version: str) -> str:
+    return (f"<!-- DEV-STANDARD:BEGIN v{version} -->\n"
+            f"<!-- 由 dev-standard 的 tools/sync.py 產生。要改規則請改 dev-standard 的 STANDARD.md 再 update；"
+            f"本 repo 自己的差異寫在這個區塊外。 -->\n{block}<!-- DEV-STANDARD:END -->\n")
+
+
+def with_block(text: str, gen: str) -> str:
+    if GEN_RE.search(text):
+        return GEN_RE.sub(lambda _m: gen, text, count=1)
+    # 沒有區塊：放在第一個 H1 之後（沒有 H1 就放最前面）
+    m = re.search(r"^# .*\n", text, re.M)
+    if m:
+        i = m.end()
+        return text[:i] + "\n" + gen + "\n" + text[i:]
+    return gen + ("\n" + text if text else "")
+
+
+def overlay_headings(text: str) -> list:
+    outside = GEN_RE.sub("", text)
+    return [h for _lvl, h in HEADING_RE.findall(outside)]
+
+
+def pinned(repo: Path) -> dict:
+    p = repo / VENDOR_DIR / "PINNED.json"
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+
+
+def targets(repo: Path, cfg: dict) -> list:
+    if is_shadow(cfg):                                   # 規則由全域帶，本 repo 的規則檔是同事共用的，不碰
+        return []
+    return [cfg["agents_file"], *cfg.get("shims", [])]
+
+
+def compute(repo: Path) -> tuple:
+    """回傳 (每個目標檔的新內容, 版本)。不寫檔。"""
+    cfg = load_config(repo)
+    std = _read(repo / VENDOR_DIR / "STANDARD.md")
+    if not std:
+        raise SystemExit(f"{repo / VENDOR_DIR / 'STANDARD.md'} 不存在：先跑 update --from <dev-standard>")
+    version = pinned(repo).get("version", "0.0.0")
+    gen = render_block(agent_block(std), version)
+    out = {}
+    for rel in targets(repo, cfg):
+        # shim 不存在就跳過（有些 repo 把各家規則檔 gitignore，新 clone 上沒有）；
+        # 要讓 render 建出來就在 config 設 create_missing_shims: true。agents_file 一定處理。
+        if rel != cfg["agents_file"] and not (repo / rel).exists() and not cfg.get("create_missing_shims"):
+            continue
+        cur = _read(repo / rel)
+        out[rel] = (cur, with_block(cur, gen))
+    return out, version
+
+
+def cmd_render(repo: Path) -> int:
+    out, version = compute(repo)
+    if is_shadow(load_config(repo)):
+        print(f"dev-standard v{version}：影子導入，規則由全域帶，不在本 repo 產生區塊")
+        return 0
+    changed = []
+    for rel, (cur, new) in out.items():
+        if new != cur:
+            p = repo / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(new, encoding="utf-8")
+            changed.append(rel)
+    print(f"dev-standard v{version}：" + ("已是最新" if not changed else "已更新 " + ", ".join(changed)))
+    return 0
+
+
+def cmd_update(repo: Path, src: Path, adopt: bool = False) -> int:
+    src = src.expanduser().resolve()
+    std = _read(src / "STANDARD.md")
+    if not std:
+        raise SystemExit(f"{src} 不是 dev-standard（找不到 STANDARD.md）")
+    # 正在跑的這份跟上游不同（例：repo 裡的舊 copy），就交給上游那份跑。
+    # 否則這一輪用舊邏輯，新功能（例：元件）要再跑第二次才生效，而輸出看起來像已經完成。
+    upstream = src / "tools" / "sync.py"
+    me = Path(__file__).resolve()
+    if upstream.is_file() and me != upstream.resolve() and _read(me) != _read(upstream):
+        print(f"這份 sync.py 與上游不同，改用上游 {upstream} 執行 update")
+        args = [sys.executable, str(upstream), "update", "--from", str(src)] + (["--adopt"] if adopt else [])
+        return subprocess.run(args, cwd=str(repo)).returncode
+    version = _read(src / "VERSION").strip() or "0.0.0"
+    vd = repo / VENDOR_DIR
+    old_pin = pinned(repo)
+    # 先驗證所有元件再動手：未知元件、壞 manifest 不會留下寫一半的狀態
+    fields = load_templates(repo)
+    cfg = load_config(repo)
+    files, configs = plan_components(src, cfg.get("components", []), version, fields)
+    if is_shadow(cfg):
+        outside = sorted(d for d in [*(f[1] for f in files), *(c[0] for c in configs)] if not d.startswith(VENDOR_DIR + "/"))
+        if outside:
+            raise SystemExit("影子導入只能裝寫進 .dev-standard/ 的元件（例：wt）；這些元件會寫到版控看得到的位置："
+                             + "、".join(outside) + "。hook 與 agent 由全域 ~/.claude 接，見 README〈導入別人的 repo，影子導入〉")
+    for info in old_pin.get("components", {}).values():       # 舊 pin 的路徑不可信：先驗，免得刪到 repo 外面
+        for dst in info.get("files", {}):
+            _safe_rel(dst, "PINNED 的檔案路徑")
+    conflicts = unpinned_conflicts(repo, files, old_pin)
+    if conflicts and not adopt:
+        print("中止，沒有寫任何檔：以下檔案已存在、不是 dev-standard 上次寫的，內容也和新版不同；蓋掉會丟掉你的內容：", file=sys.stderr)
+        for c in conflicts:
+            print(f"  {c}", file=sys.stderr)
+        print("確認要由 dev-standard 接手這些檔，就加 --adopt 重跑（原檔會先備份到 .dev-standard/backup/<日期>/）；"
+              "要保留自己的版本，就從 config.json 的 components 拿掉對應元件。", file=sys.stderr)
+        return 1
+    if conflicts:
+        bd = backup_files(repo, conflicts)
+        print(f"--adopt：{len(conflicts)} 個檔已備份到 {bd.relative_to(repo)}（不要 commit 它）：" + "、".join(conflicts))
+    vd.mkdir(exist_ok=True)
+    old = old_pin.get("version")
+    (vd / "STANDARD.md").write_text(std, encoding="utf-8")
+    shutil.copyfile(src / "tools" / "sync.py", vd / "sync.py")
+    pin = {"version": version, "sha256": _sha(std)}
+    if (repo / TEMPLATES_REL).exists():              # check 用它抓「改了 templates.json 卻沒重跑 update」
+        pin["templates_sha256"] = _sha_bytes((repo / TEMPLATES_REL).read_bytes())
+    comp_pins = write_components(repo, files, configs, old_pin)
+    if comp_pins:
+        pin["components"] = comp_pins
+    (vd / "PINNED.json").write_text(json.dumps(pin, indent=2) + "\n", encoding="utf-8")
+    if not (vd / "config.json").exists():
+        (vd / "config.json").write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n", encoding="utf-8")
+    print(f"釘版本：{old or '（無）'} → {version}")
+    rc = cmd_render(repo)
+    if is_shadow(cfg):
+        for e in shadow_setup(repo, src, version):
+            print("錯誤：" + e, file=sys.stderr)
+            rc = 1
+        return rc
+    ignored = ignore_errors(repo, pin)
+    for e in ignored:
+        print("錯誤：" + e, file=sys.stderr)
+    if ignored:
+        rc = 1
+    if any(n in SETTINGS_WIRES or n == "hooks" for n in installed(repo)):
+        print("提醒：hooks／guard／green-gate 要掛上才會生效，跑 python3 .dev-standard/sync.py wire"
+              "（--dry-run 先看會改什麼）；sync.py check 會檢查有沒有掛")
+    return rc
+
+
+def check_components(repo: Path, pin: dict) -> list:
+    """元件檔：缺檔、被手改、config 與 PINNED 對不上（沒跑 update）。"""
+    errors = []
+    want = load_config(repo).get("components", [])
+    pc = pin.get("components", {})
+    for n in want:
+        if n not in pc:
+            errors.append(f"元件「{n}」在 config.json 但 PINNED 沒釘：跑 update --from <dev-standard>")
+    for n in pc:
+        if n not in want:
+            errors.append(f"PINNED 還釘著元件「{n}」，但 config.json 已移除：跑 update 清掉")
+    for n, info in pc.items():
+        for dst, sha in info.get("files", {}).items():
+            p = repo / dst
+            if not p.exists():
+                errors.append(f"元件檔缺漏：{dst}（元件 {n}），跑 update 補回")
+            elif _sha_bytes(p.read_bytes()) != sha:
+                errors.append(f"元件檔被手改：{dst}（元件 {n}）。要改請改 dev-standard 的 components/{n}，再 update")
+    return errors
+
+
+ALLOW_PREFIX = "      "  # 放行行的縮排；測試靠它把提示原樣貼回 .gitignore
+
+
+def must_track(repo: Path, pin: dict) -> list:
+    """要進版控的 dev-standard 檔：.dev-standard/ 底下的檔（PINNED、config、各元件設定），加上 PINNED 釘的元件檔。"""
+    rels = {p.relative_to(repo).as_posix() for p in (repo / VENDOR_DIR).glob("*") if p.is_file()}
+    for info in pin.get("components", {}).values():
+        rels.update(info.get("files", {}))
+    return sorted(rels)
+
+
+def gitignored(repo: Path, rels: list):
+    """回 [(路徑, 擋它的規則)]。不是 git repo、或 git 跑不起來，回 None（呼叫端要講出來，不可當成沒問題）。
+    已追蹤的檔不算：git check-ignore 預設不報它們，它們照樣會進版控。"""
+    if not rels:
+        return []
+    try:
+        r = subprocess.run(["git", "-C", str(repo), "check-ignore", "-v", "-z", "--stdin"],
+                           input="\0".join(rels) + "\0", capture_output=True, text=True)
+    except OSError:
+        return None
+    if r.returncode not in (0, 1):
+        return None
+    f = r.stdout.split("\0")
+    out = []
+    for i in range(0, len(f) - 3, 4):          # 每筆四欄：來源、行號、規則、路徑
+        src, line, pat, path = f[i:i + 4]
+        if not pat.startswith("!"):            # -v 也會列出命中放行規則的路徑，那些沒被排除
+            out.append((path, f"{src}:{line} `{pat}`"))
+    return out
+
+
+def allow_lines(repo: Path, paths: list) -> list:
+    """貼到 .gitignore 最後就能放行 paths 的幾行。
+    被排除的祖先目錄才放行，並立刻把那層其他東西重新忽略：那些東西原本就被忽略（git 不進被排除的目錄），
+    重新忽略不會擋到任何原本進得了版控的檔。沒被排除的目錄不碰，免得把同層的檔誤擋。"""
+    dirs = sorted({"/".join(p.split("/")[:k]) for p in paths for k in range(1, len(p.split("/")))},
+                  key=lambda d: (d.count("/"), d))
+    ignored_dirs = {d.rstrip("/") for d, _ in (gitignored(repo, [d + "/" for d in dirs]) or [])}
+    out, emitted = [], set()
+    for d in dirs:
+        parent = d.rsplit("/", 1)[0] if "/" in d else None
+        if d in ignored_dirs or parent in emitted:      # 父層剛被重新忽略，這層也要放行
+            out += [f"!/{d}/", f"/{d}/*"]
+            emitted.add(d)
+    return out + [f"!/{p}" for p in sorted(paths)]
+
+
+def ignore_errors(repo: Path, pin: dict) -> list:
+    """被 .gitignore 排除的 dev-standard 檔。它們只存在這個工作目錄，其他 worktree、新 clone、CI 都拿不到。"""
+    hits = gitignored(repo, must_track(repo, pin))
+    if hits is None:
+        print("提醒：無法檢查 .gitignore（這裡不是 git repo，或 git 跑不起來）；元件檔有沒有被排除沒有驗")
+        return []
+    if not hits:
+        return []
+    allow = allow_lines(repo, [p for p, _ in hits])
+    lines = [f"{p}（被 {rule} 排除）" for p, rule in hits]
+    return ["以下 dev-standard 檔被 .gitignore 排除，不會進版控（其他 worktree、新 clone、CI 都拿不到）：\n    "
+            + "\n    ".join(lines)
+            + "\n  修法：把下面幾行加到 .gitignore 最後（白名單式的 `*`、整個目錄的 `.claude/` 都適用），"
+            "再跑 git check-ignore -v <路徑> 確認沒有輸出：\n"
+            + "\n".join(f"{ALLOW_PREFIX}{a}" for a in allow)]
+
+
+# ── 影子導入：不是自己的 repo，工具設定在、版控看不到 ──────────────────────────────
+SHADOW_EXCLUDES = (VENDOR_DIR + "/", ".claude-task/")
+GITHUB_RE = re.compile(r"(^|[/@.])github\.com[:/]")
+GENERATED_MARK = "由 dev-standard"
+
+
+def git_common_dir(repo: Path):
+    """主 checkout 與 linked worktree 共用的 .git 目錄；不是 git repo 回 None。"""
+    r = _git(repo, "rev-parse", "--git-common-dir")
+    if r.returncode != 0:
+        return None
+    d = Path(r.stdout.strip())
+    return d.resolve() if d.is_absolute() else (repo / d).resolve()
+
+
+def ensure_exclude(common: Path, lines: tuple) -> list:
+    """把 lines 加進 <git-common-dir>/info/exclude；已有的不重複。回傳這次新加的。"""
+    p = common / "info" / "exclude"
+    cur = _read(p)
+    missing = [ln for ln in lines if ln not in cur.splitlines()]
+    if missing:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if cur and not cur.endswith("\n"):
+            cur += "\n"
+        p.write_text(cur + "".join(ln + "\n" for ln in missing), encoding="utf-8")
+    return missing
+
+
+def shadow_prepush(repo: Path, src: Path, common: Path, version: str) -> str:
+    """origin 在 GitHub 的 repo，把 hooks 元件的 pre-push 寫到 <git-common-dir>/hooks/pre-push（本機檔，不進版控）。
+    不設 core.hooksPath：設了 git 就不再執行 .git/hooks/ 裡別人裝的 hook。只覆蓋自己上次寫的；別人的不碰。回一行說明。"""
+    url = _git(repo, "remote", "get-url", "origin").stdout.strip()
+    if not GITHUB_RE.search(url):
+        return f"pre-push 不接：origin 不是 GitHub（{url or '沒有 origin'}），它靠 gh 查已合併的 PR"
+    hook = common / "hooks" / "pre-push"
+    body = add_header(_read(src / COMP_DIR / "hooks" / "pre-push.sh"), "pre-push.sh", "hooks", version)
+    if hook.exists():
+        cur = hook.read_text(encoding="utf-8", errors="replace")
+        if GENERATED_MARK not in cur:
+            return f"pre-push 不接：{hook} 已存在、不是 dev-standard 寫的，不覆蓋"
+        if cur == body:
+            return f"pre-push 已是 v{version}：{hook}"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text(body, encoding="utf-8")
+    hook.chmod(0o755)
+    return f"pre-push 已寫 v{version}：{hook}（本機檔，不進版控；每次 update 會更新）"
+
+
+def shadow_setup(repo: Path, src: Path, version: str) -> list:
+    """影子導入在發檔之後要做的事：info/exclude、guard.json 骨架、pre-push。回傳錯誤清單。"""
+    common = git_common_dir(repo)
+    if common is None:
+        return ["影子導入需要 git repo：找不到 .git，exclude 與 hook 沒地方放"]
+    added = ensure_exclude(common, SHADOW_EXCLUDES)
+    print("info/exclude：" + ("已加 " + "、".join(added) if added else "已有 " + "、".join(SHADOW_EXCLUDES)))
+    gj = repo / VENDOR_DIR / "guard.json"
+    if not gj.exists():
+        shutil.copyfile(src / COMP_DIR / "guard" / "guard.example.json", gj)
+        print(f"已建 {VENDOR_DIR}/guard.json（空骨架；R2／R3 路徑自己填，全域的 guard 會讀它）")
+    print(shadow_prepush(repo, src, common, version))
+    return []
+
+
+def shadow_gaps(repo: Path) -> list:
+    """check 用：exclude 少了行就等於工具設定會出現在 git status 裡。"""
+    common = git_common_dir(repo)
+    if common is None:
+        return ["影子導入但這裡不是 git repo"]
+    cur = _read(common / "info" / "exclude").splitlines()
+    missing = [ln for ln in SHADOW_EXCLUDES if ln not in cur]
+    return [f"info/exclude 少了 {'、'.join(missing)}：跑 sync.py update --from <dev-standard>"] if missing else []
+
+
+def cmd_shadow(repo: Path, src: Path) -> int:
+    """把不是自己的 repo 設成影子導入再 update。config 不存在就建 {"mode": "shadow", "components": ["wt"]}；存在就只加 mode。"""
+    if not (repo / ".git").exists():
+        raise SystemExit(f"{repo} 不是 git repo：影子導入要寫 .git/info/exclude 與 .git/hooks，沒有 .git 就沒地方放")
+    cp = repo / VENDOR_DIR / "config.json"
+    cfg = json.loads(cp.read_text(encoding="utf-8")) if cp.exists() else {"components": ["wt"]}
+    cfg["mode"] = SHADOW_MODE
+    cp.parent.mkdir(exist_ok=True)
+    cp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return cmd_update(repo, src)
+
+
+HOOKS_PATH = ".githooks"
+SETTINGS_REL = ".claude/settings.json"
+GUARD_MATCHER = "Bash|Edit|Write|MultiEdit|NotebookEdit|Read"
+# 元件 → (settings.json 的事件, 要掛的 entry, 用來辨識「已經掛了」的檔名)。順序固定，輸出才穩定。
+SETTINGS_WIRES = {
+    "guard": ("PreToolUse", {"matcher": GUARD_MATCHER, "hooks": [
+        {"type": "command", "command": 'python3 "$CLAUDE_PROJECT_DIR/.claude/hooks/guard.py"', "timeout": 30}]},
+              ".claude/hooks/guard.py"),
+    "green-gate": ("Stop", {"hooks": [
+        {"type": "command", "command": 'python3 "$CLAUDE_PROJECT_DIR/.claude/hooks/green_gate.py"', "timeout": 960}]},
+                   ".claude/hooks/green_gate.py"),
+}
+
+
+def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+
+
+def _load_settings(repo: Path) -> dict:
+    return _load_settings_file(repo / SETTINGS_REL)
+
+
+def _load_settings_file(p: Path) -> dict:
+    """settings.json 不存在回 {}；壞掉就大聲失敗，絕不覆蓋使用者的檔。"""
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except ValueError as e:
+        raise SystemExit(f"{p} 不是合法 JSON，不動它：{e}")
+    if not isinstance(data, dict):
+        raise SystemExit(f"{p} 最外層必須是物件，不動它")
+    return data
+
+
+def _event_groups(data: dict, event: str) -> list:
+    hooks = data.get("hooks", {})
+    if not isinstance(hooks, dict) or not isinstance(hooks.get(event, []), list):
+        raise SystemExit(f"{SETTINGS_REL} 的 hooks.{event} 不是預期的形狀（hooks 要是物件、{event} 要是清單），不動它")
+    return hooks.get(event, [])
+
+
+def _has_hook(groups: list, marker: str) -> bool:
+    for g in groups:
+        for h in (g.get("hooks", []) if isinstance(g, dict) else []):
+            if isinstance(h, dict) and marker in str(h.get("command", "")):
+                return True
+    return False
+
+
+def merge_settings(data: dict, names: list, wires: dict = None) -> dict:
+    """把 names 列的元件需要的 hook entry 併進 data：既有的 entry 與順序都保留，已經掛了的不重複，新的接在該事件的最後。"""
+    wires = SETTINGS_WIRES if wires is None else wires
+    out = json.loads(json.dumps(data))
+    for name in names:
+        if name not in wires:
+            continue
+        event, entry, marker = wires[name]
+        if _has_hook(_event_groups(out, event), marker):
+            continue
+        out.setdefault("hooks", {}).setdefault(event, []).append(json.loads(json.dumps(entry)))
+    return out
+
+
+def installed(repo: Path) -> list:
+    return [n for n in load_config(repo).get("components", []) if isinstance(n, str)]
+
+
+def _hooks_path_value(repo: Path) -> str:
+    """worktree 自己的 core.hooksPath（app 開的 worktree 設在 config.worktree）優先，沒有再看 repo 的 local。"""
+    for scope in ("--worktree", "--local"):
+        v = _git(repo, "config", scope, "--get", "core.hooksPath").stdout.strip()
+        if v:
+            return v
+    return ""
+
+
+def _hooks_path_ok(repo: Path, cur: str) -> bool:
+    """core.hooksPath 指到本 repo 的 HOOKS_PATH，或（git worktree）指到主 checkout 的 HOOKS_PATH 都算掛好。"""
+    if cur == HOOKS_PATH:
+        return True
+    if not cur or not (repo / cur).is_dir():
+        return False
+    got = (repo / cur).resolve()
+    ok = {(repo / HOOKS_PATH).resolve()}
+    # --git-common-dir 的上層在 submodule／separate-git-dir 不是主 checkout：只會多報，不會漏報
+    common = _git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+    if common:
+        ok.add((Path(common).parent / HOOKS_PATH).resolve())
+    return got in ok
+
+
+def wiring_gaps(repo: Path, local: bool = True) -> list:
+    """已安裝但沒掛上的東西，每項一行。local=False 不看 core.hooksPath（它是本機狀態，CI 的新 clone 一定是空的）。"""
+    names = installed(repo)
+    gaps = []
+    if "denylist-gate" in names and "hooks" not in names:
+        gaps.append("未掛載：denylist-gate 需要 hooks 元件（它掛在 .githooks/pre-commit.d/，由 hooks 的 pre-commit 串起來）；config.json 的 components 加上 hooks")
+    if "r3-gate" in names and "pr-checks" not in names:
+        gaps.append("未掛載：r3-gate 需要 pr-checks 元件（workflow 跑的是 .dev-standard/bin/pr_checks/run.py --gate）；config.json 的 components 加上 pr-checks")
+    if "hooks" in names and local:
+        cur = _hooks_path_value(repo)
+        if not _hooks_path_ok(repo, cur):
+            gaps.append(f"未掛載：core.hooksPath（現值：{cur or '未設'}，應為 {HOOKS_PATH}）；跑 sync.py wire")
+    hook = repo / HOOKS_PATH / "pre-commit"
+    if "hooks" in names and (repo / ".pre-commit-config.yaml").exists() and hook.exists() \
+            and FRAMEWORK_MARK not in hook.read_text(encoding="utf-8", errors="replace"):
+        gaps.append("未串接：repo 有 .pre-commit-config.yaml，但 .githooks/pre-commit 是舊 copy，不會跑 pre-commit framework"
+                    "（密鑰掃描無聲停止）；跑 sync.py update --from <dev-standard>")
+    data = _load_settings(repo)
+    for name in names:
+        if name in SETTINGS_WIRES:
+            event, _entry, marker = SETTINGS_WIRES[name]
+            if not _has_hook(_event_groups(data, event), marker):
+                gaps.append(f"未掛載：{SETTINGS_REL} 的 hooks.{event} 沒有 {marker}（元件 {name}）；跑 sync.py wire")
+    return gaps
+
+
+# pre-commit framework 產生的 shim 固定有這一行。用整行比對，不用網址子字串（CodeQL 會誤判成網址驗證）
+PRECOMMIT_SHIM_RE = re.compile(r"^# File generated by pre-commit: https://pre-commit\.com", re.M)
+FRAMEWORK_MARK = "DEV_PRECOMMIT_FRAMEWORK_SKIP"   # hooks 元件的 pre-commit 有串接 pre-commit framework 的記號；舊 copy 沒有
+
+
+def foreign_git_hooks(repo: Path) -> list:
+    """$(git rev-parse --git-common-dir)/hooks 裡不是 .sample、也不是 hooks 元件會串接的檔。
+    core.hooksPath 一設，git 就不再執行這些檔：不處理就是無聲停用。
+    唯一例外：repo 有 .pre-commit-config.yaml 時，pre-commit framework 自己裝的 pre-commit shim（元件的 pre-commit 會串接它）。"""
+    r = _git(repo, "rev-parse", "--git-common-dir")
+    if r.returncode != 0:
+        return []
+    d = (repo / r.stdout.strip() / "hooks").resolve()
+    if not d.is_dir():
+        return []
+    out = []
+    for f in sorted(d.iterdir()):
+        if not f.is_file() or f.name.endswith(".sample"):
+            continue
+        chained = repo / HOOKS_PATH / "pre-commit"     # 豁免只在元件的 pre-commit 真的會串接 framework 時成立
+        if f.name == "pre-commit" and (repo / ".pre-commit-config.yaml").exists() \
+                and PRECOMMIT_SHIM_RE.search(f.read_text(encoding="utf-8", errors="replace")) \
+                and chained.is_file() and FRAMEWORK_MARK in chained.read_text(encoding="utf-8", errors="replace"):
+            continue
+        out.append(f.name)
+    return out
+
+
+def cmd_wire(repo: Path, dry_run: bool = False, force_hookspath: bool = False) -> int:
+    """把已安裝的元件掛進 git 與 .claude/settings.json。冪等：跑兩次跟跑一次一樣。不刪使用者原有的任何 entry。"""
+    names = installed(repo)
+    problems = []
+    if "hooks" in names:
+        cur = _git(repo, "config", "--local", "--get", "core.hooksPath").stdout.strip()
+        if cur == HOOKS_PATH:
+            print(f"core.hooksPath 已是 {HOOKS_PATH}")
+        elif cur:
+            problems.append(f"core.hooksPath 已設成別的值（{cur}），不覆蓋；確認後自行改成 {HOOKS_PATH}")
+        elif (foreign := foreign_git_hooks(repo)) and not force_hookspath:
+            problems.append("不設 core.hooksPath：設了之後 git 不再執行 .git/hooks/ 裡這些 hook，等於無聲停用："
+                            + "、".join(foreign) + "。確認它們已由別的方式接手（或不需要）後，加 --force-hookspath 再跑 wire")
+        elif dry_run:
+            print(f"[dry-run] 會設定 core.hooksPath = {HOOKS_PATH}")
+        else:
+            r = _git(repo, "config", "--local", "core.hooksPath", HOOKS_PATH)
+            if r.returncode != 0:
+                problems.append(f"設定 core.hooksPath 失敗：{r.stderr.strip() or '不是 git repo？'}")
+            else:
+                print(f"已設定 core.hooksPath = {HOOKS_PATH}")
+    p = repo / SETTINGS_REL
+    cur_data = _load_settings(repo)
+    new_data = merge_settings(cur_data, names)
+    if new_data == cur_data:
+        print(f"{SETTINGS_REL} 已掛好（沒有要改的）")
+    else:
+        old_text = p.read_text(encoding="utf-8") if p.exists() else ""
+        new_text = json.dumps(new_data, indent=2, ensure_ascii=False) + "\n"
+        if dry_run:
+            sys.stdout.writelines(difflib.unified_diff(old_text.splitlines(True), new_text.splitlines(True),
+                                                       f"a/{SETTINGS_REL}", f"b/{SETTINGS_REL}"))
+        else:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if p.exists():
+                shutil.copyfile(p, p.with_name(p.name + ".bak"))
+            p.write_text(new_text, encoding="utf-8")
+            print(f"已更新 {SETTINGS_REL}（原檔備份在 {SETTINGS_REL}.bak）")
+    for msg in problems:
+        print(f"未掛載：{msg}")
+    return 1 if problems else 0
+
+
+GLOBAL_HOOK_DIR = ".claude/hooks/dev-standard"
+GLOBAL_COMPONENT = "loopback-hooks"
+GLOBAL_MODEL = "sonnet"
+REPLACE_MODEL = "opusplan"
+
+
+def global_wires(base: str) -> dict:
+    """全域 hook 的 settings entry。base 是 home 的寫法（"$HOME" 或絕對路徑）；marker 是判重用的相對尾巴，與 base 無關。"""
+    def entry(script: str, timeout: int, matcher: str = None) -> tuple:
+        marker = f"hooks/dev-standard/{script}"
+        # `|| exit 1`：腳本檔不見（checkout 搬走、換分支）時 python3 會回 2，Claude Code 把 2 當成「擋」，
+        # 會卡死所有派工、所有提示與每次 Stop；改成 1 是不擋、stderr 給使用者看。腳本自己從不刻意回 2。
+        cmd = f'python3 "{base}/{GLOBAL_HOOK_DIR}/{script}" || exit 1'
+        group = {"hooks": [{"type": "command", "command": cmd, "timeout": timeout}]}
+        if matcher:
+            group = {"matcher": matcher, **group}
+        return group, marker
+
+    out = {}
+    for key, event, script, timeout, matcher in (
+            ("dispatch-gate", "PreToolUse", "dispatch_gate.py", 10, "Agent|Task"),
+            ("correction-nudge", "UserPromptSubmit", "correction_nudge.py", 10, None),
+            ("gate-fail-nudge", "PostToolUse", "gate_fail_nudge.py", 10, "Bash"),
+            # Bash 結束碼非 0 時 Claude Code 可能走 PostToolUseFailure 而不是 PostToolUse，兩個都掛，腳本兩種形狀都認
+            ("gate-fail-nudge-failure", "PostToolUseFailure", "gate_fail_nudge.py", 10, "Bash"),
+            ("loopback-stop", "Stop", "loopback_stop.py", 15, None)):
+        group, marker = entry(script, timeout, matcher)
+        out[key] = (event, group, marker)
+    return out
+
+
+def plan_global_links(src: Path, home: Path) -> tuple:
+    """回 (要建或換的 [(連結, 目標)], 衝突清單)。已經指對的略過；指到別處的 symlink 換掉；同名的真實檔案不蓋。"""
+    d, man = load_manifest(src, GLOBAL_COMPONENT)
+    todo, conflicts = [], []
+    for f in man["files"]:
+        link = home / _safe_rel(f.get("dst", ""), "dst")
+        target = d / _safe_rel(f.get("src", ""), "src")
+        if not target.is_file():
+            raise SystemExit(f"元件「{GLOBAL_COMPONENT}」的來源檔不存在：{target}")
+        if link.is_symlink():
+            if os.readlink(link) != str(target):
+                todo.append((link, target))
+        elif link.exists():
+            conflicts.append(link)
+        else:
+            todo.append((link, target))
+    return todo, conflicts
+
+
+def cmd_wire_global(src: Path, home: Path, dry_run: bool = False) -> int:
+    """把全域 hook 掛進 <home>/.claude：symlink 指向這個 checkout，settings.json 併 hook entry、model 設 sonnet。
+
+    冪等；先寫 .bak；settings.json 壞掉或有同名真實檔案時什麼都不動。
+    """
+    settings_p = home / SETTINGS_REL
+    base = "$HOME" if home.resolve() == Path.home().resolve() else str(home)
+    cur = _load_settings_file(settings_p)
+    new = merge_settings(cur, list(global_wires(base)), global_wires(base))
+    old_model = new.get("model")
+    # 使用者裁定換掉的是 opusplan；之後刻意設的值不悄悄蓋回去（DD-2026-1108）
+    if old_model in (None, REPLACE_MODEL):
+        new["model"] = GLOBAL_MODEL
+    todo, conflicts = plan_global_links(src, home)
+    if conflicts:
+        for c in conflicts:
+            print(f"衝突：{c} 已經有一個不是 symlink 的檔，不蓋；確認後自行移開再跑 wire-global", file=sys.stderr)
+        return 1
+    tag = "[dry-run] " if dry_run else ""
+    if old_model in (None, REPLACE_MODEL):
+        print(f"{tag}model: {old_model if old_model is not None else '(未設)'} → {GLOBAL_MODEL}")
+    elif old_model != GLOBAL_MODEL:
+        print(f"{tag}model: 保留 {old_model}（只換掉 {REPLACE_MODEL} 或未設定）")
+    for link, target in todo:
+        print(f"{tag}{'會建立' if dry_run else '建立'} symlink：{link} → {target}")
+        if not dry_run:
+            link.parent.mkdir(parents=True, exist_ok=True)
+            if link.is_symlink():
+                link.unlink()
+            link.symlink_to(target)
+    if new == cur:
+        print(f"{SETTINGS_REL} 已掛好（沒有要改的）")
+        return 0
+    old_text = settings_p.read_text(encoding="utf-8") if settings_p.exists() else ""
+    new_text = json.dumps(new, indent=2, ensure_ascii=False) + "\n"
+    if dry_run:
+        sys.stdout.writelines(difflib.unified_diff(old_text.splitlines(True), new_text.splitlines(True),
+                                                   f"a/{SETTINGS_REL}", f"b/{SETTINGS_REL}"))
+        return 0
+    settings_p.parent.mkdir(parents=True, exist_ok=True)
+    if settings_p.exists():
+        shutil.copyfile(settings_p, settings_p.with_name(settings_p.name + ".bak"))
+    settings_p.write_text(new_text, encoding="utf-8")
+    print(f"已更新 {settings_p}（原檔備份在 {settings_p.name}.bak）")
+    return 0
+
+
+def cmd_check(repo: Path, local: bool = True) -> int:
+    errors = []
+    pin = pinned(repo)
+    # 先講檢查的是哪個 repo、釘哪一版：在別的 worktree 或目錄跑時，「一致」不會被讀成在講別的 repo
+    print(f"檢查 {repo.resolve()}（釘 v{pin.get('version') if pin else '無'}）")
+    std = _read(repo / VENDOR_DIR / "STANDARD.md")
+    if not pin or not std:
+        errors.append("缺 .dev-standard/PINNED.json 或 STANDARD.md：先跑 update --from <dev-standard>")
+    elif _sha(std) != pin.get("sha256"):
+        errors.append(".dev-standard/STANDARD.md 被手改過（sha 與 PINNED 不符）。規則要改在 dev-standard，再 update")
+    if not errors:
+        out, _v = compute(repo)
+        stale = [rel for rel, (cur, new) in out.items() if cur != new]
+        if stale:
+            errors.append("區塊過期或被手改：" + ", ".join(stale) + "（跑 sync.py render）")
+        std_heads = set(overlay_headings(_read(repo / VENDOR_DIR / "STANDARD.md")))
+        cfg = load_config(repo)
+        dup = [] if is_shadow(cfg) else [h for h in overlay_headings(_read(repo / cfg["agents_file"])) if h in std_heads]
+        for h in dup:   # 提醒不擋：是不是漂移由人判斷
+            print(f"提醒：overlay 有跟正本同名的段落「{h}」，可能是漂移或該回填")
+    errors += check_components(repo, pin)
+    tp = repo / TEMPLATES_REL
+    if pin and (_sha_bytes(tp.read_bytes()) if tp.is_file() else None) != pin.get("templates_sha256"):
+        errors.append(f"{TEMPLATES_REL} 跟上次 update 時不同，範本還是舊的：跑 sync.py update --from <dev-standard>")
+    errors += shadow_gaps(repo) if is_shadow(load_config(repo)) else ignore_errors(repo, pin)
+    errors += wiring_gaps(repo, local)
+    if errors:
+        print("dev-standard 檢查失敗：\n- " + "\n- ".join(errors))
+        return 1
+    print(f"dev-standard v{pin.get('version')}：一致")
+    return 0
+
+
+def cmd_status(repo: Path, src: Path) -> int:
+    src = src.expanduser().resolve()
+    up_v = _read(src / "VERSION").strip()
+    up_sha = _sha(_read(src / "STANDARD.md"))
+    pin = pinned(repo)
+    if pin.get("sha256") == up_sha:
+        print(f"跟上游一致（v{up_v}）")
+        return 0
+    print(f"落後上游：本 repo v{pin.get('version')}，上游 v{up_v}。跑 update --from {src} 並看 CHANGELOG")
+    return 0
+
+
+def cmd_report(repos: list) -> int:
+    seen: dict = {}
+    print("# overlay 段落（區塊外，repo 自己的差異）\n")
+    for r in repos:
+        repo = Path(r).expanduser().resolve()
+        cfg = load_config(repo)
+        if is_shadow(cfg):
+            print(f"## {repo.name}（影子導入，沒有 overlay；候選看回填帳本）\n")
+            continue
+        heads = overlay_headings(_read(repo / cfg["agents_file"]))
+        print(f"## {repo.name}（{cfg['agents_file']}）")
+        for h in heads:
+            print(f"- {h}")
+            seen.setdefault(h, []).append(repo.name)
+        print()
+    shared = {h: rs for h, rs in seen.items() if len(set(rs)) > 1}
+    print("# 回填候選：兩個以上 repo 都有的段落標題（只列不判）\n")
+    for h, rs in sorted(shared.items()):
+        print(f"- {h}：{', '.join(sorted(set(rs)))}")
+    if not shared:
+        print("（無）")
+    return 0
+
+
+SOURCE_FILE = ".claude/.dev-standard/source.local.json"
+
+
+def resolve_source(given, env: dict, home: Path) -> tuple:
+    """dev-standard 在哪：--from，否則 $DEV_STANDARD，否則 ~/<SOURCE_FILE> 的 dev_standard。回 (路徑, 出處)。
+
+    路徑每台機器只記一處；dev-standard 搬家時改這一處，各 repo 的升版指令不用動。
+    """
+    if given:
+        return Path(given).expanduser(), "--from"
+    if env.get("DEV_STANDARD"):
+        return Path(env["DEV_STANDARD"]).expanduser(), "$DEV_STANDARD"
+    f = home / SOURCE_FILE
+    if f.exists():
+        try:
+            value = json.loads(f.read_text(encoding="utf-8"))["dev_standard"]
+        except (ValueError, KeyError, TypeError) as e:
+            raise SystemExit(f"{f} 讀不出 dev_standard：{e}")
+        p = Path(value)
+        return (home / p.relative_to("~") if value.startswith("~") else p), str(f)
+    raise SystemExit("找不到 dev-standard：給 --from <路徑>、設 $DEV_STANDARD，"
+                     f'或寫 ~/{SOURCE_FILE}：{{"dev_standard": "<路徑>"}}')
+
+
+def main(argv: list) -> int:
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "report":
+        return cmd_report(rest or ["."])
+    if cmd == "wire-global":
+        home = rest[rest.index("--home") + 1] if "--home" in rest and rest.index("--home") + 1 < len(rest) else None
+        return cmd_wire_global(Path(__file__).resolve().parents[1],
+                               Path(home).expanduser() if home else Path.home(), dry_run="--dry-run" in rest)
+
+    def opt(name: str):
+        if name in rest:
+            i = rest.index(name)
+            return rest[i + 1] if i + 1 < len(rest) else None
+        return None
+
+    repo = Path(opt("--repo") or ".")
+    repo = find_repo(repo)
+    if cmd == "render":
+        return cmd_render(repo)
+    if cmd == "check":
+        return cmd_check(repo, local="--no-local" not in rest)
+    if cmd == "wire":
+        return cmd_wire(repo, dry_run="--dry-run" in rest, force_hookspath="--force-hookspath" in rest)
+    if cmd in ("update", "status", "shadow"):
+        src, how = resolve_source(opt("--from"), dict(os.environ), Path.home())
+        if how != "--from":
+            print(f"dev-standard：{src}（來自 {how}）", file=sys.stderr)
+        if cmd == "shadow":
+            return cmd_shadow(repo, Path(src))
+        return cmd_update(repo, Path(src), adopt="--adopt" in rest) if cmd == "update" else cmd_status(repo, Path(src))
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

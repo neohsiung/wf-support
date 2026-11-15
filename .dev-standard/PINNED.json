@@ -1,0 +1,33 @@
+{
+  "version": "0.23.2",
+  "sha256": "c068fb335ff788bdeeffc9f1a046cbfe65b09f0abce20c060b4e80ee73cdfdb9",
+  "components": {
+    "hooks": {
+      "files": {
+        ".githooks/pre-commit": "395c9dd8f1191b32577a7698e22fa73b26b3b22d371909ceb781e028cbfadb5f",
+        ".githooks/pre-push": "779b20fb469ccdb30f23114569a3fc965caa626631e1d4079b0d07fa0482941f"
+      }
+    },
+    "wt": {
+      "files": {
+        ".dev-standard/bin/wt.sh": "1930a620ddec50c9170777f4d291d92184aa0ce7477e59ebd8f7dccf1b7765b7"
+      }
+    },
+    "pr-template": {
+      "files": {
+        ".github/pull_request_template.md": "c5cc6b45ab96499a1e71008900a7e153225926e081b9615a09ca1a163ba90064"
+      }
+    },
+    "pr-checks": {
+      "files": {
+        ".dev-standard/bin/pr_checks/__init__.py": "64e73db8a1d8d5ab3a71f8a0990f3e2cc0240e75b4e2f6c97ba608e18a4a56a4",
+        ".dev-standard/bin/pr_checks/risk.py": "e318f341c41da4bcca06a856918ce32eeb0a95016fb25b05d5692f8224be963e",
+        ".dev-standard/bin/pr_checks/checks.py": "29fc7eb692b85da7410784ab55651627344bcc865d6971d3f87ee26ce35897e6",
+        ".dev-standard/bin/pr_checks/merge.py": "e5ae5d35da992e56a5dcd325404dad028aedb7c6af241351d2fec21a80c77271",
+        ".dev-standard/bin/pr_checks/gh.py": "102622476e0335cd2d2f17403842a0bc01cc21f49cf479317a93d26751778b94",
+        ".dev-standard/bin/pr_checks/run.py": "d9d1f21fb0c53ec0031a3a4b2264bb9e3a5dcf82077154500ad56fa048342d54",
+        ".github/workflows/pr-checks.yml": "e3ac7252685cc29fef268356f1b29b28952f48f6e5c9bbed5e3aaa62037a2e61"
+      }
+    }
+  }
+}
