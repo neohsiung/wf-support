@@ -1,0 +1,13 @@
+{
+ "agents_file": "AGENTS.md",
+ "shims": [
+  "CLAUDE.md"
+ ],
+ "create_missing_shims": true,
+ "components": [
+  "hooks",
+  "wt",
+  "pr-template",
+  "pr-checks"
+ ]
+}
